@@ -15,6 +15,7 @@ Usage:
 import argparse
 import sys
 from pathlib import Path
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -27,6 +28,37 @@ sys.path.append(str(Path(__file__).parent.parent / "src"))
 from config import Config
 from utils.logging_config import setup_logging
 
+
+def correlation_prune_columns(df: pd.DataFrame, threshold: float) -> List[str]:
+    """Return list of columns to keep after pruning highly correlated features.
+
+    Works on numeric DataFrame `df`. Builds absolute Pearson correlation matrix
+    and drops one of each pair with |corr| >= threshold (keeps earlier columns).
+    """
+    if df.shape[1] <= 1:
+        return df.columns.tolist()
+
+    corr_matrix = df.corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+
+    to_drop: set[str] = set()
+    for col in upper.columns:
+        if col in to_drop:
+            continue
+        high_corr = upper[col][upper[col] >= threshold].index.tolist()
+        to_drop.update(high_corr)
+
+    keep_cols = [c for c in df.columns if c not in to_drop]
+    return keep_cols
+
+
+def variance_prune_columns(df: pd.DataFrame, threshold: float) -> List[str]:
+    """Return list of columns to keep after removing near-zero variance features."""
+    if df.shape[1] == 0:
+        return []
+    variances = df.var(axis=0)
+    keep_cols = variances[variances > threshold].index.tolist()
+    return keep_cols
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CV training with XGBoost (GPU if available)")
@@ -55,6 +87,25 @@ def parse_args() -> argparse.Namespace:
         "--auto-drop-leakers",
         action="store_true",
         help="Auto-drop features with near-perfect single-feature AUC (>=0.999 or <=0.001)",
+    )
+    parser.add_argument(
+        "--reduce",
+        type=str,
+        default=None,
+        choices=[None, "corr", "var"],
+        help="Optional feature reduction: 'corr' for correlation pruning, 'var' for variance threshold",
+    )
+    parser.add_argument(
+        "--corr-threshold",
+        type=float,
+        default=0.98,
+        help="Absolute correlation threshold for pruning when --reduce=corr",
+    )
+    parser.add_argument(
+        "--var-threshold",
+        type=float,
+        default=0.0,
+        help="Variance threshold for pruning when --reduce=var",
     )
     return parser.parse_args()
 
@@ -216,6 +267,39 @@ def main() -> None:
                 x_valid_fold = x_valid_fold.drop(columns=[c for c in leaker_cols if c in x_valid_fold.columns])
                 x_test_fold = x_test_fold.drop(columns=[c for c in leaker_cols if c in x_test_fold.columns])
                 logger.info("Dropped %d suspected leaker columns", len(leaker_cols))
+
+        # Feature reduction within fold (fit on train, apply to valid/test)
+        if args.reduce is not None:
+            numeric_train = x_train_fold.select_dtypes(include=[np.number])
+            non_numeric_cols = [c for c in x_train_fold.columns if c not in numeric_train.columns]
+
+            if args.reduce == "corr":
+                keep_numeric = correlation_prune_columns(numeric_train, threshold=float(args.corr_threshold))
+            elif args.reduce == "var":
+                keep_numeric = variance_prune_columns(numeric_train, threshold=float(args.var_threshold))
+            else:
+                keep_numeric = numeric_train.columns.tolist()
+
+            cols_fold = keep_numeric + [c for c in non_numeric_cols if c in x_valid_fold.columns and c in x_test_fold.columns]
+            x_train_fold = x_train_fold.reindex(columns=cols_fold)
+            x_valid_fold = x_valid_fold.reindex(columns=cols_fold)
+            x_test_fold = x_test_fold.reindex(columns=cols_fold)
+
+            # Save a summary of kept columns for this fold
+            try:
+                kept_summary_path = models_dir / f"reduction_fold_{fold}.txt"
+                with kept_summary_path.open("w", encoding="utf-8") as f:
+                    f.write(f"Method: {args.reduce}\n")
+                    if args.reduce == "corr":
+                        f.write(f"corr_threshold: {args.corr_threshold}\n")
+                    if args.reduce == "var":
+                        f.write(f"var_threshold: {args.var_threshold}\n")
+                    f.write(f"num_features_kept: {len(cols_fold)}\n")
+                    f.write("columns:\n")
+                    for c in cols_fold:
+                        f.write(f"{c}\n")
+            except Exception:
+                pass
 
         model = xgb_classifier_cls(**params)
         try:
