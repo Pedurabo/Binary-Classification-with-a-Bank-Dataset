@@ -15,12 +15,13 @@ Usage:
 import argparse
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
+from sklearn.feature_selection import mutual_info_classif
 
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent / "src"))
@@ -59,6 +60,56 @@ def variance_prune_columns(df: pd.DataFrame, threshold: float) -> List[str]:
     variances = df.var(axis=0)
     keep_cols = variances[variances > threshold].index.tolist()
     return keep_cols
+
+
+def select_features_mutual_information(x_num: pd.DataFrame, y: pd.Series, k_top: Optional[int]) -> List[str]:
+    """Select features by mutual information (higher is better). Returns kept column names."""
+    if x_num.shape[1] == 0:
+        return []
+    if k_top is None or k_top >= x_num.shape[1]:
+        return x_num.columns.tolist()
+    scores = mutual_info_classif(x_num.fillna(x_num.median()), y, random_state=0)
+    order = np.argsort(scores)[::-1]
+    keep_idx = order[:k_top]
+    return [x_num.columns[i] for i in keep_idx]
+
+
+def select_features_model_importance(
+    x_num: pd.DataFrame,
+    y: pd.Series,
+    k_top: Optional[int],
+    importance_quantile: Optional[float],
+    seed: int,
+    n_jobs: int,
+    use_gpu: bool,
+) -> List[str]:
+    """Select features via quick XGBoost importance on the train fold."""
+    from xgboost import XGBClassifier  # local import
+
+    if x_num.shape[1] == 0:
+        return []
+
+    quick_params = build_xgb_params(n_jobs=n_jobs, seed=seed, use_gpu=use_gpu)
+    quick_params = {**quick_params, "n_estimators": 200, "max_depth": 5, "learning_rate": 0.05}
+    model = XGBClassifier(**quick_params)
+    model.fit(x_num, y, verbose=False)
+    importances = getattr(model, "feature_importances_", None)
+    if importances is None:
+        return x_num.columns.tolist()
+
+    order = np.argsort(importances)[::-1]
+    cols = x_num.columns.to_list()
+
+    if k_top is not None and k_top > 0:
+        keep = [cols[i] for i in order[:min(k_top, len(cols))]]
+        return keep
+
+    if importance_quantile is not None and 0.0 <= importance_quantile <= 1.0:
+        thr = np.quantile(importances, importance_quantile)
+        keep = [c for c, w in zip(cols, importances) if w >= thr]
+        return keep if keep else cols
+
+    return cols
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CV training with XGBoost (GPU if available)")
@@ -106,6 +157,25 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Variance threshold for pruning when --reduce=var",
+    )
+    parser.add_argument(
+        "--select",
+        type=str,
+        default=None,
+        choices=[None, "mi", "model"],
+        help="Optional feature selection: 'mi' for mutual information, 'model' for model-based importance",
+    )
+    parser.add_argument(
+        "--k-top",
+        type=int,
+        default=None,
+        help="Keep top-K features after selection (applies to --select)",
+    )
+    parser.add_argument(
+        "--importance-quantile",
+        type=float,
+        default=None,
+        help="For --select=model: keep features with importance >= given quantile (0-1). Ignored if --k-top is set.",
     )
     return parser.parse_args()
 
@@ -294,6 +364,47 @@ def main() -> None:
                         f.write(f"corr_threshold: {args.corr_threshold}\n")
                     if args.reduce == "var":
                         f.write(f"var_threshold: {args.var_threshold}\n")
+                    f.write(f"num_features_kept: {len(cols_fold)}\n")
+                    f.write("columns:\n")
+                    for c in cols_fold:
+                        f.write(f"{c}\n")
+            except Exception:
+                pass
+
+        # Feature selection within fold (fit on train, apply to valid/test)
+        if args.select is not None:
+            numeric_train = x_train_fold.select_dtypes(include=[np.number])
+            non_numeric_cols = [c for c in x_train_fold.columns if c not in numeric_train.columns]
+
+            if args.select == "mi":
+                keep_numeric = select_features_mutual_information(numeric_train, y_train_fold, args.k_top)
+            elif args.select == "model":
+                keep_numeric = select_features_model_importance(
+                    numeric_train,
+                    y_train_fold,
+                    args.k_top,
+                    args.importance_quantile,
+                    seed=args.seed,
+                    n_jobs=args.n_jobs,
+                    use_gpu=use_gpu,
+                )
+            else:
+                keep_numeric = numeric_train.columns.tolist()
+
+            cols_fold = keep_numeric + [c for c in non_numeric_cols if c in x_valid_fold.columns and c in x_test_fold.columns]
+            x_train_fold = x_train_fold.reindex(columns=cols_fold)
+            x_valid_fold = x_valid_fold.reindex(columns=cols_fold)
+            x_test_fold = x_test_fold.reindex(columns=cols_fold)
+
+            # Save selection summary
+            try:
+                kept_summary_path = models_dir / f"selection_fold_{fold}.txt"
+                with kept_summary_path.open("w", encoding="utf-8") as f:
+                    f.write(f"Method: {args.select}\n")
+                    if args.k_top is not None:
+                        f.write(f"k_top: {args.k_top}\n")
+                    if args.importance_quantile is not None:
+                        f.write(f"importance_quantile: {args.importance_quantile}\n")
                     f.write(f"num_features_kept: {len(cols_fold)}\n")
                     f.write("columns:\n")
                     for c in cols_fold:
