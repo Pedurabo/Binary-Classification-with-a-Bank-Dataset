@@ -40,6 +40,22 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Cap duration and campaign at this percentile (e.g., 0.99)",
     )
+    parser.add_argument(
+        "--cap-within-fold",
+        action="store_true",
+        help="Compute cap thresholds on train fold only (prevents leakage)",
+    )
+    parser.add_argument(
+        "--use-combined",
+        type=str,
+        default=None,
+        help="Path to combined or combined_fe parquet/csv with a 'split' column",
+    )
+    parser.add_argument(
+        "--auto-drop-leakers",
+        action="store_true",
+        help="Auto-drop features with near-perfect single-feature AUC (>=0.999 or <=0.001)",
+    )
     return parser.parse_args()
 
 
@@ -92,30 +108,50 @@ def main() -> None:
     reports_dir.mkdir(parents=True, exist_ok=True)
     models_dir.mkdir(parents=True, exist_ok=True)
 
-    train_path = data_dir / "train_processed.csv"
-    test_path = data_dir / "test_processed.csv"
-    if not train_path.exists() or not test_path.exists():
-        raise FileNotFoundError(
-            f"Processed data not found. Expected {train_path} and {test_path}. Run data_preprocessing first."
-        )
-
-    train_df = pd.read_csv(train_path)
-    test_df = pd.read_csv(test_path)
-    if "y" not in train_df.columns:
-        raise ValueError("Column 'y' not found in processed training data.")
-
-    X = train_df.drop(columns=["y"])
-    y = train_df["y"].astype(int)
-    # Drop non-informative identifiers if present
-    if "id" in X.columns:
-        X = X.drop(columns=["id"]) 
-    if "id" in test_df.columns:
-        X_test = test_df.drop(columns=["id"]).copy()
+    if args.use_combined:
+        comb_path = Path(args.use_combined)
+        if not comb_path.exists():
+            raise FileNotFoundError(f"Combined dataset not found at {comb_path}")
+        if comb_path.suffix.lower() == ".parquet":
+            combined = pd.read_parquet(comb_path)
+        else:
+            combined = pd.read_csv(comb_path)
+        if "split" not in combined.columns:
+            raise ValueError("Combined dataset must contain a 'split' column with values 'train'/'test'")
+        train_df = combined[combined["split"] == "train"].drop(columns=["split"]).copy()
+        test_df = combined[combined["split"] == "test"].drop(columns=["split"]).copy()
+        if "y" not in train_df.columns:
+            raise ValueError("Combined train rows must include 'y' column")
+        # Align columns
+        feature_cols = sorted(list(set(train_df.columns) | set(test_df.columns) - {"y"}))
+        X = train_df.reindex(columns=feature_cols).copy()
+        y = train_df["y"].astype(int)
+        X_test = test_df.reindex(columns=feature_cols).copy()
     else:
-        X_test = test_df.copy()
+        train_path = data_dir / "train_processed.csv"
+        test_path = data_dir / "test_processed.csv"
+        if not train_path.exists() or not test_path.exists():
+            raise FileNotFoundError(
+                f"Processed data not found. Expected {train_path} and {test_path}. Run data_preprocessing first."
+            )
+
+        train_df = pd.read_csv(train_path)
+        test_df = pd.read_csv(test_path)
+        if "y" not in train_df.columns:
+            raise ValueError("Column 'y' not found in processed training data.")
+
+        X = train_df.drop(columns=["y"])
+        y = train_df["y"].astype(int)
+        # Drop non-informative identifiers if present
+        if "id" in X.columns:
+            X = X.drop(columns=["id"]) 
+        if "id" in test_df.columns:
+            X_test = test_df.drop(columns=["id"]).copy()
+        else:
+            X_test = test_df.copy()
     
     # Optional feature engineering (sensitivity tests)
-    if args.cap_pct is not None:
+    if args.cap_pct is not None and not args.cap_within_fold:
         for col in ["duration", "campaign"]:
             if col in X.columns and col in X_test.columns:
                 cap_val = X[col].quantile(args.cap_pct)
@@ -143,8 +179,43 @@ def main() -> None:
     fold_metrics = []
 
     for fold, (trn_idx, val_idx) in enumerate(kf.split(X, y), start=1):
-        x_train_fold, x_valid_fold = X.iloc[trn_idx], X.iloc[val_idx]
+        x_train_fold, x_valid_fold = X.iloc[trn_idx].copy(), X.iloc[val_idx].copy()
         y_train_fold, y_valid_fold = y.iloc[trn_idx], y.iloc[val_idx]
+        x_test_fold = X_test.copy()
+
+        # Within-fold transforms to avoid leakage
+        if args.cap_pct is not None and args.cap_within_fold:
+            for col in ["duration", "campaign"]:
+                if col in x_train_fold.columns:
+                    cap_val = x_train_fold[col].quantile(args.cap_pct)
+                    x_train_fold[col] = np.clip(x_train_fold[col], None, cap_val)
+                    if col in x_valid_fold.columns:
+                        x_valid_fold[col] = np.clip(x_valid_fold[col], None, cap_val)
+                    if col in x_test_fold.columns:
+                        x_test_fold[col] = np.clip(x_test_fold[col], None, cap_val)
+
+        # Auto-drop leaker features evaluated on train fold
+        if args.auto_drop_leakers:
+            from sklearn.metrics import roc_auc_score  # local import
+            leaker_cols: list[str] = []
+            for col in x_train_fold.columns:
+                try:
+                    s = x_train_fold[col]
+                    # Skip non-numeric columns just in case
+                    if not np.issubdtype(s.dtype, np.number):
+                        continue
+                    # Single-feature AUC
+                    auc = roc_auc_score(y_train_fold, s.fillna(s.median()))
+                    if auc >= 0.999 or auc <= 0.001:
+                        leaker_cols.append(col)
+                except Exception:
+                    continue
+            if leaker_cols:
+                # Drop from all splits consistently
+                x_train_fold = x_train_fold.drop(columns=leaker_cols)
+                x_valid_fold = x_valid_fold.drop(columns=[c for c in leaker_cols if c in x_valid_fold.columns])
+                x_test_fold = x_test_fold.drop(columns=[c for c in leaker_cols if c in x_test_fold.columns])
+                logger.info("Dropped %d suspected leaker columns", len(leaker_cols))
 
         model = xgb_classifier_cls(**params)
         try:
@@ -180,7 +251,7 @@ def main() -> None:
         model.save_model(str(model_path))
 
         # Test predictions for this fold
-        test_pred = model.predict_proba(X_test)[:, 1]
+        test_pred = model.predict_proba(x_test_fold)[:, 1]
         test_preds.append(test_pred)
 
     # OOF and overall metric
