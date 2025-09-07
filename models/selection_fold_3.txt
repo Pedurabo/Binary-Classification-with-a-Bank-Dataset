@@ -1,0 +1,20 @@
+Method: model
+k_top: 60
+num_features_kept: 16
+columns:
+duration
+housing
+contact
+poutcome
+loan
+month
+balance
+campaign
+marital
+education
+age
+job
+day
+default
+previous
+pdays

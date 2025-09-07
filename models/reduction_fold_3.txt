@@ -1,0 +1,20 @@
+Method: corr
+corr_threshold: 0.99
+num_features_kept: 16
+columns:
+age
+job
+marital
+education
+default
+balance
+housing
+loan
+contact
+day
+month
+duration
+campaign
+pdays
+previous
+poutcome

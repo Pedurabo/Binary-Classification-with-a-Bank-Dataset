@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test", type=str, default=None, help="Path to test_processed.csv if not using combined")
     p.add_argument("--kmeans", type=int, default=0, help="If >0, run KMeans with K clusters on selected columns")
     p.add_argument("--kmeans-cols", nargs='*', default=None, help="Columns to use for KMeans (default: all numeric)")
+    p.add_argument("--shap", action="store_true", help="Compute SHAP-based feature importance using a quick XGBoost model")
+    p.add_argument("--shap-n-samples", type=int, default=5000, help="Max training rows to sample for SHAP (speed)")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -104,8 +106,17 @@ def compute_target_correlations(train_df: pd.DataFrame) -> pd.DataFrame:
     corrs = []
     for col in X.columns:
         try:
-            c = np.corrcoef(X[col].fillna(X[col].median()), y)[0, 1]
-            corrs.append({"feature": col, "corr_abs": abs(float(c)), "corr": float(c)})
+            s = X[col].replace([np.inf, -np.inf], np.nan)
+            s = s.fillna(s.median())
+            # Guard against constant columns (zero std -> NaN correlation)
+            if np.isclose(float(np.nanstd(s)), 0.0) or np.isclose(float(np.nanstd(y)), 0.0):
+                c = 0.0
+            else:
+                with np.errstate(invalid='ignore', divide='ignore'):
+                    c = float(pd.Series(s).corr(pd.Series(y), method='pearson'))
+                if np.isnan(c):
+                    c = 0.0
+            corrs.append({"feature": col, "corr_abs": abs(c), "corr": c})
         except Exception:
             continue
     return pd.DataFrame(corrs).sort_values("corr_abs", ascending=False)
@@ -153,6 +164,55 @@ def kmeans_summary(df: pd.DataFrame, k: int, cols: List[str] | None, seed: int) 
     return summary
 
 
+def compute_shap_importance(train_df: pd.DataFrame, seed: int, max_samples: int) -> pd.DataFrame:
+    """Train a quick XGBoost model and compute mean(|SHAP|) per feature.
+
+    To keep it fast, subsample up to max_samples rows.
+    """
+    try:
+        import shap  # type: ignore
+        from xgboost import XGBClassifier
+    except Exception as exc:
+        raise RuntimeError("SHAP or xgboost is not installed. Please `pip install shap xgboost`." ) from exc
+
+    y = train_df["y"].astype(int)
+    X = train_df.drop(columns=["y"]).select_dtypes(include=[np.number])
+    if X.shape[1] == 0:
+        return pd.DataFrame(columns=["feature", "shap_mean_abs"])    
+
+    # Subsample for speed
+    if len(X) > max_samples:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(X), size=max_samples, replace=False)
+        X = X.iloc[idx].copy()
+        y = y.iloc[idx].copy()
+
+    model = XGBClassifier(
+        n_estimators=400,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=seed,
+        n_jobs=-1,
+        tree_method="hist",
+    )
+    model.fit(X, y, verbose=False)
+
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X)
+
+    # shap_values can be (n_samples, n_features)
+    if isinstance(shap_values, list):
+        # For multiclass models returns list; we have binary so take last
+        sv = shap_values[-1]
+    else:
+        sv = shap_values
+
+    mean_abs = np.abs(sv).mean(axis=0)
+    return pd.DataFrame({"feature": X.columns, "shap_mean_abs": mean_abs}).sort_values("shap_mean_abs", ascending=False)
+
+
 def main() -> None:
     args = parse_args()
     reports_dir = Path("reports")
@@ -182,11 +242,18 @@ def main() -> None:
         km = kmeans_summary(train_df.drop(columns=["y"]), k=args.kmeans, cols=cols, seed=args.seed)
         km.to_csv(reports_dir / "kmeans_summary.csv", index=False)
 
+    # Optional SHAP
+    if args.shap:
+        shap_imp = compute_shap_importance(train_df, seed=args.seed, max_samples=int(args.shap_n_samples))
+        shap_imp.to_csv(reports_dir / "shap_importance.csv", index=False)
+
     print("Data mining reports written to:")
     for f in ["univariate_auc.csv", "mutual_info.csv", "target_correlations.csv", "model_importance.csv"]:
         print(reports_dir / f)
     if args.kmeans and args.kmeans > 0:
         print(reports_dir / "kmeans_summary.csv")
+    if args.shap:
+        print(reports_dir / "shap_importance.csv")
 
 
 if __name__ == "__main__":
