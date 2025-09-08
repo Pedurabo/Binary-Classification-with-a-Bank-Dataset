@@ -219,3 +219,4 @@ node_modules/
 # Local development
 local/
 dev/
+warehouse.duckdb
