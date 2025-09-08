@@ -68,3 +68,11 @@ kaggle==1.6.14
 streamlit
 seaborn
 matplotlib
+streamlit
+seaborn
+matplotlib
+pandas
+numpy
+scikit-learn
+xgboost
+shap
