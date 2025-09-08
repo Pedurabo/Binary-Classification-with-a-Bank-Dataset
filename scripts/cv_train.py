@@ -177,6 +177,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="For --select=model: keep features with importance >= given quantile (0-1). Ignored if --k-top is set.",
     )
+    parser.add_argument(
+        "--features-file",
+        type=str,
+        default=None,
+        help="Optional path to a newline-delimited list of feature names to keep (applied within each fold)",
+    )
     return parser.parse_args()
 
 
@@ -368,6 +374,19 @@ def main() -> None:
                     f.write("columns:\n")
                     for c in cols_fold:
                         f.write(f"{c}\n")
+            except Exception:
+                pass
+
+        # Apply explicit feature list if provided (last step before modeling)
+        if args.features_file:
+            try:
+                with open(args.features_file, "r", encoding="utf-8") as f:
+                    keep_list = [line.strip() for line in f if line.strip()]
+                keep_cols = [c for c in x_train_fold.columns if c in keep_list]
+                if keep_cols:
+                    x_train_fold = x_train_fold.reindex(columns=keep_cols)
+                    x_valid_fold = x_valid_fold.reindex(columns=keep_cols)
+                    x_test_fold = x_test_fold.reindex(columns=keep_cols)
             except Exception:
                 pass
 
